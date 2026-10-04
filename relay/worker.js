@@ -1,11 +1,15 @@
 // Pyinsect report relay (Cloudflare Worker).
-// The website sends each invasive-species report here; this worker checks it and saves it to
-// reports/ in the GitHub repo with a token that only Cloudflare knows.
+// 1. The website sends each invasive-species report here; this worker checks it and saves it to
+//    reports/ in a PRIVATE GitHub repo with a token that only Cloudflare knows.
+// 2. The reports page lives here too, at a secret address and behind a password:
+//    https://<this worker>/<VIEW_PATH>/
 //
 // Settings (Cloudflare → this worker → Settings → Variables and Secrets):
 //   GITHUB_TOKEN    Secret. Fine-grained token, Contents: Read and write on the repo below.
-//   GITHUB_REPO     Text, e.g. edafawd/Test
+//   GITHUB_REPO     Text, e.g. edafawd/pyinsect-reports-data (private)
 //   ALLOWED_ORIGIN  Text, e.g. https://edafawd.github.io
+//   VIEW_PASSWORD   Secret. Password for the reports page.
+//   VIEW_PATH       Secret. The secret word in the reports page address (letters, digits, - and _).
 
 // Must match INVASIVE in index.html
 const INVASIVE = new Set([
@@ -15,59 +19,73 @@ const INVASIVE = new Set([
   "fire_ant", "formosan_termite", "japanese_beetle", "oriental_beetle", "rose_chafer",
   "spongy_moth", "spotted_lanternfly"
 ]);
+const SITE_CSS = "https://edafawd.github.io/Test/assets/site.css";
 const MAX_PHOTO_BYTES = 1.5 * 1024 * 1024;
 const MAX_AGE_DAYS = 60;            // reports can wait offline on a phone for a while
 const PER_IP_LIMIT = 30;            // reports per IP per hour (per Cloudflare server, best effort)
+const WRONG_PASSWORD_LIMIT = 10;    // wrong passwords per IP per 15 minutes (best effort)
+const SHOW = 40;                    // newest reports sent to the reports page
+const LIST_CACHE_MS = 5000;         // GitHub is asked for the file list at most every 5 s
 
 const ID_RE = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-[0-9a-f]{1,8}$/;
 const SPECIES_RE = /^[a-z_]{1,48}$/;
 const TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/;
-const recent = new Map();
+const recent = new Map(), wrong = new Map();
+const reportCache = new Map();      // id → report JSON (reports never change)
+let listCache = { at: 0, ids: null };
 
 export default {
   async fetch(request, env) {
-    const cors = {
-      "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN || "*",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
-      "Access-Control-Max-Age": "86400",
-      Vary: "Origin",
-    };
-    const reply = (status, body) => new Response(JSON.stringify(body), {
-      status, headers: { ...cors, "Content-Type": "application/json" },
-    });
-
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
-    if (request.method === "GET") return reply(200, { ok: true, service: "pyinsect-relay" });
-    if (request.method !== "POST") return reply(405, { error: "Use POST." });
-    const origin = request.headers.get("Origin");
-    if (env.ALLOWED_ORIGIN && origin !== env.ALLOWED_ORIGIN) return reply(403, { error: "Reports are only accepted from the Pyinsect site." });
-    if (!env.GITHUB_TOKEN || !env.GITHUB_REPO) return reply(500, { error: "The relay isn't set up yet (GITHUB_TOKEN / GITHUB_REPO missing)." });
-
-    const ip = request.headers.get("CF-Connecting-IP") || "?";
-    const hour = Math.floor(Date.now() / 3600000);
-    const seen = recent.get(ip);
-    const count = seen && seen.hour === hour ? seen.count : 0;
-    if (count >= PER_IP_LIMIT) return reply(429, { error: "Too many reports from this network. Try again later." });
-
-    let body;
-    try { body = await request.json(); } catch { return reply(400, { error: "Not valid JSON." }); }
-    const checked = checkReport(body);
-    if (checked.error) return reply(400, { error: checked.error });
-    recent.set(ip, { hour, count: count + 1 });
-    if (recent.size > 5000) recent.clear();
-
-    const { report, photo } = checked;
-    try {
-      // Photo first, so the report pages only list a report once its photo exists
-      await githubCreate(env, `reports/${report.id}.jpg`, photo, `Photo for ${report.name} report`);
-      await githubCreate(env, `reports/${report.id}.json`, toBase64(JSON.stringify(report, null, 1)), `Invasive species report: ${report.name}`);
-    } catch (e) {
-      return reply(502, { error: e.message });
+    const url = new URL(request.url);
+    const view = env.VIEW_PATH ? "/" + env.VIEW_PATH : null;
+    if (view && (url.pathname === view || url.pathname.startsWith(view + "/"))) {
+      return viewer(request, env, url.pathname.slice(view.length));
     }
-    return reply(201, { ok: true, id: report.id });
+    return submit(request, env);
   },
 };
+
+// ---------- receiving reports from the website ----------
+
+async function submit(request, env) {
+  const cors = {
+    "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN || "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "86400",
+    Vary: "Origin",
+  };
+  const reply = (status, body) => new Response(JSON.stringify(body), {
+    status, headers: { ...cors, "Content-Type": "application/json" },
+  });
+
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+  if (request.method === "GET") return reply(200, { ok: true, service: "pyinsect-relay" });
+  if (request.method !== "POST") return reply(405, { error: "Use POST." });
+  const origin = request.headers.get("Origin");
+  if (env.ALLOWED_ORIGIN && origin !== env.ALLOWED_ORIGIN) return reply(403, { error: "Reports are only accepted from the Pyinsect site." });
+  if (!env.GITHUB_TOKEN || !env.GITHUB_REPO) return reply(500, { error: "The relay isn't set up yet (GITHUB_TOKEN / GITHUB_REPO missing)." });
+
+  const ip = request.headers.get("CF-Connecting-IP") || "?";
+  if (!allow(recent, ip, 3600000, PER_IP_LIMIT)) return reply(429, { error: "Too many reports from this network. Try again later." });
+
+  let body;
+  try { body = await request.json(); } catch { return reply(400, { error: "Not valid JSON." }); }
+  const checked = checkReport(body);
+  if (checked.error) return reply(400, { error: checked.error });
+  count(recent, ip, 3600000);
+
+  const { report, photo } = checked;
+  try {
+    // Photo first, so the reports page only lists a report once its photo exists
+    await githubCreate(env, `reports/${report.id}.jpg`, photo, `Photo for ${report.name} report`);
+    await githubCreate(env, `reports/${report.id}.json`, toBase64(JSON.stringify(report, null, 1)), `Invasive species report: ${report.name}`);
+  } catch (e) {
+    return reply(502, { error: e.message });
+  }
+  listCache.at = 0;
+  return reply(201, { ok: true, id: report.id });
+}
 
 // Accepts only well-formed invasive reports and rebuilds them from known fields
 function checkReport(body) {
@@ -103,7 +121,7 @@ function checkReport(body) {
       id: r.id,
       timestamp: r.timestamp,
       species: r.species,
-      name: r.species.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase()),
+      name: niceName(r.species),
       confidence: r.confidence,
       top3: r.top3.map(t => ({ species: t.species, confidence: t.confidence })),
       photo: `${r.id}.jpg`,
@@ -113,27 +131,284 @@ function checkReport(body) {
   };
 }
 
-// Creates a file; never overwrites (GitHub answers 422 when the file already exists)
-async function githubCreate(env, path, base64, message) {
-  const res = await fetch(`https://api.github.com/repos/${env.GITHUB_REPO}/contents/${path}`, {
-    method: "PUT",
+// ---------- the password-protected reports page ----------
+
+async function viewer(request, env, rest) {
+  const headers = { "Cache-Control": "no-store", "X-Robots-Tag": "noindex", "Referrer-Policy": "no-referrer" };
+  if (rest === "") return Response.redirect(new URL(request.url).href + "/", 301);
+  if (rest === "/") return new Response(PAGE, { headers: { ...headers, "Content-Type": "text/html; charset=utf-8" } });
+  const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { ...headers, "Content-Type": "application/json" } });
+
+  if (!rest.startsWith("/api/")) return new Response("Not found", { status: 404, headers });
+  if (!env.VIEW_PASSWORD || !env.GITHUB_TOKEN || !env.GITHUB_REPO) return json(500, { error: "The relay isn't fully set up (VIEW_PASSWORD / GITHUB_TOKEN / GITHUB_REPO)." });
+
+  const ip = request.headers.get("CF-Connecting-IP") || "?";
+  if (!allow(wrong, ip, 900000, WRONG_PASSWORD_LIMIT)) return json(429, { error: "Too many wrong passwords. Wait 15 minutes." });
+  if (!(await samePassword(request.headers.get("X-Password") || "", env.VIEW_PASSWORD))) {
+    count(wrong, ip, 900000);
+    return json(401, { error: "Wrong password." });
+  }
+
+  try {
+    if (rest === "/api/reports") return json(200, await latestReports(env));
+    const photo = rest.match(/^\/api\/photo\/([0-9a-f-]{1,40})$/);
+    if (photo && ID_RE.test(photo[1])) {
+      const res = await githubRead(env, `reports/${photo[1]}.jpg`);
+      if (!res) return json(404, { error: "No such photo." });
+      return new Response(res.body, { headers: { "Content-Type": "image/jpeg", "Cache-Control": "private, max-age=31536000, immutable", "X-Robots-Tag": "noindex" } });
+    }
+    return json(404, { error: "Not found." });
+  } catch (e) {
+    return json(502, { error: e.message });
+  }
+}
+
+// Newest reports, read from the private repo with the token (5,000 GitHub requests an hour)
+async function latestReports(env) {
+  if (!listCache.ids || Date.now() - listCache.at > LIST_CACHE_MS) {
+    const res = await gh(env, `git/trees/HEAD?recursive=1`);
+    let ids = [];
+    if (res.ok) {
+      const tree = (await res.json()).tree || [];
+      const names = new Set(tree.map(t => t.path));
+      ids = tree.map(t => t.path.match(/^reports\/(.+)\.json$/)).filter(Boolean).map(m => m[1])
+        .filter(id => ID_RE.test(id) && names.has(`reports/${id}.jpg`))
+        .sort().reverse();
+    } else if (res.status !== 404 && res.status !== 409) {   // 404/409 = no files yet
+      throw new Error(ghError(res.status));
+    }
+    listCache = { at: Date.now(), ids };
+  }
+  const ids = listCache.ids;
+  // Cloudflare allows ~50 outgoing requests per visit, so load at most 40 new reports at a time
+  const missing = ids.slice(0, SHOW).filter(id => !reportCache.has(id)).slice(0, 40);
+  await Promise.all(missing.map(async id => {
+    const res = await githubRead(env, `reports/${id}.json`);
+    if (res) { try { reportCache.set(id, await res.json()); } catch {} }
+  }));
+  return { total: ids.length, reports: ids.slice(0, SHOW).filter(id => reportCache.has(id)).map(id => reportCache.get(id)) };
+}
+
+async function samePassword(given, real) {
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([given, real].map(s => crypto.subtle.digest("SHA-256", enc.encode(s))));
+  const x = new Uint8Array(a), y = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
+// ---------- GitHub ----------
+
+function gh(env, path, init = {}) {
+  return fetch(`https://api.github.com/repos/${env.GITHUB_REPO}/${path}`, {
+    ...init,
     headers: {
       Authorization: `Bearer ${env.GITHUB_TOKEN}`,
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
       "User-Agent": "pyinsect-relay",
+      ...(init.headers || {}),
     },
-    body: JSON.stringify({ message, content: base64 }),
   });
-  if (res.status === 422) return;   // already saved on an earlier try
-  if (res.status === 401) throw new Error("The relay's GitHub token was rejected (expired?).");
-  if (res.status === 403 || res.status === 404) throw new Error("The relay's GitHub token can't write to the repo.");
-  if (!res.ok) throw new Error(`GitHub answered ${res.status}.`);
 }
 
+function ghError(status) {
+  if (status === 401) return "The relay's GitHub token was rejected (expired?).";
+  if (status === 403 || status === 404) return "The relay's GitHub token can't use the reports repo.";
+  return `GitHub answered ${status}.`;
+}
+
+// Creates a file; never overwrites (GitHub answers 422 when the file already exists)
+async function githubCreate(env, path, base64, message) {
+  const res = await gh(env, `contents/${path}`, { method: "PUT", body: JSON.stringify({ message, content: base64 }) });
+  if (res.status === 422) return;   // already saved on an earlier try
+  if (!res.ok) throw new Error(ghError(res.status));
+}
+
+// Raw file contents, or null if it doesn't exist
+async function githubRead(env, path) {
+  const res = await gh(env, `contents/${path}`, { headers: { Accept: "application/vnd.github.raw" } });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(ghError(res.status));
+  return res;
+}
+
+// ---------- helpers ----------
+
+function allow(map, key, windowMs, limit) {
+  const slot = Math.floor(Date.now() / windowMs), e = map.get(key);
+  return !(e && e.slot === slot && e.n >= limit);
+}
+function count(map, key, windowMs) {
+  const slot = Math.floor(Date.now() / windowMs), e = map.get(key);
+  map.set(key, { slot, n: e && e.slot === slot ? e.n + 1 : 1 });
+  if (map.size > 5000) map.clear();
+}
+function niceName(s) { return s.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase()); }
 function toBase64(s) {
   const bytes = new TextEncoder().encode(s);
   let bin = "";
   for (const b of bytes) bin += String.fromCharCode(b);
   return btoa(bin);
 }
+
+const PAGE = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<title>Pyinsect Reports</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="${SITE_CSS}">
+<style>
+.login { display: flex; flex-direction: column; gap: 10px; max-width: 360px; padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.login input[type=password] { font: 15px var(--mono); padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--ink); }
+.login label { font-size: 13px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="eyebrow">Pyinsect field reports · private</span>
+    <h1>Latest invasive find</h1>
+    <span id="status" class="status">Loading…</span>
+  </header>
+
+  <form id="login" class="login" hidden>
+    <strong>Enter the reports password</strong>
+    <input id="pw" type="password" autocomplete="current-password" required>
+    <label><input id="remember" type="checkbox" checked> Remember on this device</label>
+    <div class="actions"><button class="btn primary" type="submit">Open reports</button><span id="loginMsg" class="status error"></span></div>
+  </form>
+
+  <section id="latest"></section>
+  <section class="ledger" id="tallySection" hidden><h2 id="tallyTitle">Species reported</h2><div class="tally" id="tally"></div></section>
+  <section class="ledger" id="earlierSection" hidden><h2>Earlier reports</h2><div class="rows" id="earlier"></div></section>
+  <div class="actions" id="logoutBox" hidden><button id="logout" class="btn" type="button">Log out on this device</button></div>
+</div>
+
+<script>
+var REFRESH_MS = 15000, KEY = "pyinsect.viewpw";
+var $ = function (id) { return document.getElementById(id); };
+var password = null, timer = null, photoUrls = {};
+try { password = localStorage.getItem(KEY) || sessionStorage.getItem(KEY); } catch (e) {}
+
+function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function niceName(s) { return s.replace(/_/g, " ").replace(/\\b\\w/g, function (c) { return c.toUpperCase(); }); }
+function when(iso) {
+  var d = new Date(iso); if (isNaN(d)) return { ago: iso, full: iso };
+  var m = Math.round((Date.now() - d) / 60000);
+  var ago = m < 1 ? "just now" : m < 60 ? m + " min ago" : m < 1440 ? Math.round(m / 60) + " h ago" : Math.round(m / 1440) + " days ago";
+  return { ago: ago, full: d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) };
+}
+
+function api(path) {
+  return fetch("api/" + path, { headers: { "X-Password": password || "" }, cache: path === "reports" ? "no-store" : "default" });
+}
+
+// Photos need the password header, so they're fetched as blobs (once each)
+function photo(img, id) {
+  if (photoUrls[id]) { img.src = photoUrls[id]; return; }
+  api("photo/" + id).then(function (r) { return r.ok ? r.blob() : null; }).then(function (b) {
+    if (b) { photoUrls[id] = URL.createObjectURL(b); img.src = photoUrls[id]; }
+  });
+}
+
+function hero(r) {
+  var card = el("article", "hero"), img = el("img"), info = el("div", "info");
+  img.alt = "Photo of the reported " + r.name; photo(img, r.id);
+  info.append(el("span", "flag", "Invasive"), el("p", "species", r.name || niceName(r.species)));
+  var w = when(r.timestamp), facts = el("dl", "facts");
+  [["Reported", w.ago + " · " + w.full], ["Confidence", Number(r.confidence).toFixed(1) + "%"], ["Model", r.model || "—"], ["Report", r.id]]
+    .forEach(function (kv) { facts.append(el("dt", null, kv[0]), el("dd", null, kv[1])); });
+  info.append(facts);
+  if (Array.isArray(r.top3) && r.top3.length) {
+    info.append(el("span", "eyebrow", "Model's top guesses"));
+    var alts = el("div", "alts");
+    r.top3.forEach(function (a) {
+      var row = el("div", "alt"), track = el("div", "track"), fill = el("div", "fill");
+      fill.style.width = Math.min(100, a.confidence) + "%"; track.append(fill);
+      row.append(el("span", null, niceName(a.species)), track, el("span", "pct", Number(a.confidence).toFixed(0) + "%"));
+      alts.append(row);
+    });
+    info.append(alts);
+  }
+  card.append(img, info);
+  return card;
+}
+
+function row(r) {
+  var x = el("div", "row"), img = el("img"), what = el("div", "what");
+  img.alt = ""; img.loading = "lazy"; photo(img, r.id);
+  what.append(el("strong", null, r.name || niceName(r.species)), el("span", "muted", Number(r.confidence).toFixed(1) + "% confidence"));
+  x.append(img, what, el("span", "when", when(r.timestamp).full));
+  return x;
+}
+
+var shownIds = "";
+async function refresh() {
+  var status = $("status");
+  try {
+    var res = await api("reports");
+    if (res.status === 401) { showLogin("Wrong password."); return; }
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.error || ("Error " + res.status));
+    $("login").hidden = true; $("logoutBox").hidden = false;
+    var list = data.reports, ids = list.map(function (r) { return r.id; }).join();
+    if (ids !== shownIds) {
+      shownIds = ids;
+      var box = $("latest"); box.innerHTML = "";
+      if (!list.length) box.append(el("div", "empty", "No invasive insects have been reported yet. New reports appear here within seconds."));
+      else box.append(hero(list[0]));
+      var earlier = $("earlier"); earlier.innerHTML = "";
+      list.slice(1).forEach(function (r) { earlier.append(row(r)); });
+      $("earlierSection").hidden = list.length < 2;
+      var counts = {};
+      list.forEach(function (r) { var n = r.name || niceName(r.species); counts[n] = (counts[n] || 0) + 1; });
+      var tally = $("tally"); tally.innerHTML = "";
+      Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; })
+        .forEach(function (n) { tally.append(el("span", "chip", n + " × " + counts[n])); });
+      $("tallyTitle").textContent = data.total > list.length ? "Species in the newest " + list.length + " reports" : "Species reported";
+      $("tallySection").hidden = !list.length;
+    }
+    status.className = "status";
+    status.textContent = data.total + " report" + (data.total === 1 ? "" : "s") + " · checked " +
+      new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) + " · refreshes every 15 seconds";
+  } catch (e) {
+    status.className = "status error";
+    status.textContent = e.message + " Retrying…";
+  }
+}
+
+function showLogin(msg) {
+  clearInterval(timer); timer = null;
+  try { localStorage.removeItem(KEY); sessionStorage.removeItem(KEY); } catch (e) {}
+  password = null; shownIds = "";
+  ["latest", "earlier", "tally"].forEach(function (id) { $(id).innerHTML = ""; });
+  $("earlierSection").hidden = $("tallySection").hidden = $("logoutBox").hidden = true;
+  $("login").hidden = false; $("loginMsg").textContent = msg || "";
+  $("status").className = "status"; $("status").textContent = "Password needed";
+  $("pw").focus();
+}
+
+function start() {
+  refresh();
+  if (!timer) timer = setInterval(function () { if (!document.hidden) refresh(); }, REFRESH_MS);
+}
+
+$("login").onsubmit = function (e) {
+  e.preventDefault();
+  password = $("pw").value; $("pw").value = "";
+  try { ($("remember").checked ? localStorage : sessionStorage).setItem(KEY, password); } catch (e) {}
+  start();
+};
+$("logout").onclick = function () { showLogin(""); };
+document.addEventListener("visibilitychange", function () { if (!document.hidden && timer) refresh(); });
+
+if (password) start(); else showLogin("");
+</script>
+</body>
+</html>`;
