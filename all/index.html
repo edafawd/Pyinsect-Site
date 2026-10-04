@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>All Reports · Pyinsect</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <nav><a href="../">Identify</a><a href="../latest/">Latest</a><span class="muted">All reports</span></nav>
+    <span class="eyebrow">Pyinsect field reports</span>
+    <h1>Invasive insects reported by the Pyinsect app</h1>
+    <p class="muted" style="margin:0;max-width:62ch">Each time the app identifies an invasive species in a photo, it files a report here with the photo and the model's confidence. The <a href="../latest/">latest report</a> page always shows the newest find.</p>
+    <span id="status" class="status">Loading reports…</span>
+  </header>
+
+  <section class="ledger" id="tallySection" hidden>
+    <h2>Species reported</h2>
+    <div class="tally" id="tally"></div>
+  </section>
+
+  <section class="ledger">
+    <h2>Recent reports</h2>
+    <div class="rows" id="rows"></div>
+  </section>
+</div>
+
+<script src="../assets/reports.js"></script>
+<script>
+const SHOW = 30;
+
+async function refresh() {
+  const status = document.getElementById("status");
+  const rows = document.getElementById("rows");
+  try {
+    const list = await listReports();
+    if (!list.length) {
+      rows.outerHTML = '<div class="empty" id="rows">No reports yet. They appear here as soon as the app sends its first one.</div>';
+      status.textContent = "Checked just now";
+      return;
+    }
+    const reports = await Promise.all(list.slice(0, SHOW).map(loadReport));
+    rows.innerHTML = "";
+    for (const r of reports) {
+      const row = el("div", "row");
+      const img = el("img"); img.alt = ""; img.loading = "lazy"; img.src = r.photoUrl || "";
+      const what = el("div", "what");
+      what.append(el("strong", null, r.name || niceName(r.species)), el("span", "muted", `${Number(r.confidence).toFixed(1)}% confidence · ${r.model || ""}`));
+      const when = formatWhen(r.timestamp);
+      row.append(img, what, el("span", "when", typeof when === "string" ? when : when.full));
+      rows.append(row);
+    }
+    const counts = {};
+    reports.forEach(r => { const n = r.name || niceName(r.species); counts[n] = (counts[n] || 0) + 1; });
+    const tally = document.getElementById("tally");
+    tally.innerHTML = "";
+    Object.entries(counts).sort((a, b) => b[1] - a[1]).forEach(([n, c]) => tally.append(el("span", "chip", `${n} × ${c}`)));
+    document.getElementById("tallySection").hidden = false;
+    status.className = "status";
+    status.textContent = list.length > SHOW ? `Showing the newest ${SHOW} of ${list.length} reports` : `${list.length} report${list.length === 1 ? "" : "s"}`;
+  } catch (e) {
+    status.className = "status error";
+    status.textContent = e.message;
+  }
+}
+refresh();
+</script>
+</body>
+</html>
