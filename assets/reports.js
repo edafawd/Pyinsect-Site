@@ -4,7 +4,7 @@
 const OWNER = "";
 const REPO = "";
 // The report relay (Cloudflare Worker, see relay/worker.js). Empty = reporting off.
-const RELAY_URL = "";
+const RELAY_URL = "https://pyinsect-relay.pandadifferent246.workers.dev";
 
 function repoFromLocation() {
   const host = location.hostname;
