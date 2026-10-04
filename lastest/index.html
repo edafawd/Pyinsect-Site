@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Latest Invasive Report · Pyinsect</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <nav><a href="../">Identify</a><span class="muted">Latest</span><a href="../all/">All reports</a></nav>
+    <span class="eyebrow">Pyinsect field reports</span>
+    <h1>Latest invasive find</h1>
+    <span id="status" class="status">Loading the newest report…</span>
+  </header>
+
+  <section id="latest"></section>
+
+  <section class="ledger" id="earlierSection" hidden>
+    <h2>Earlier reports</h2>
+    <div class="rows" id="earlier"></div>
+  </section>
+</div>
+
+<script src="../assets/reports.js"></script>
+<script>
+const EARLIER = 8;
+
+function renderHero(r) {
+  const box = document.getElementById("latest");
+  box.innerHTML = "";
+  const card = el("article", "hero");
+  const img = el("img"); img.alt = `Photo of the reported ${r.name}`; img.src = r.photoUrl || "";
+  const info = el("div", "info");
+  info.append(el("span", "flag", "Invasive"), el("p", "species", r.name || niceName(r.species)));
+
+  const when = formatWhen(r.timestamp);
+  const facts = el("dl", "facts");
+  for (const [k, v] of [
+    ["Reported", typeof when === "string" ? when : `${when.ago} · ${when.full}`],
+    ["Confidence", `${Number(r.confidence).toFixed(1)}%`],
+    ["Model", r.model || "—"],
+    ["Report", r.id],
+  ]) { facts.append(el("dt", null, k), el("dd", null, v)); }
+  info.append(facts);
+
+  if (Array.isArray(r.top3) && r.top3.length) {
+    info.append(el("span", "eyebrow", "Model's top guesses"));
+    const alts = el("div", "alts");
+    for (const a of r.top3) {
+      const row = el("div", "alt");
+      const track = el("div", "track"), fill = el("div", "fill");
+      fill.style.width = `${Math.min(100, a.confidence)}%`; track.append(fill);
+      row.append(el("span", null, niceName(a.species)), track, el("span", "pct", `${Number(a.confidence).toFixed(0)}%`));
+      alts.append(row);
+    }
+    info.append(alts);
+  }
+  card.append(img, info);
+  box.append(card);
+}
+
+function renderRow(r) {
+  const row = el("div", "row");
+  const img = el("img"); img.alt = ""; img.loading = "lazy"; img.src = r.photoUrl || "";
+  const what = el("div", "what");
+  what.append(el("strong", null, r.name || niceName(r.species)), el("span", "muted", `${Number(r.confidence).toFixed(1)}% confidence`));
+  const when = formatWhen(r.timestamp);
+  row.append(img, what, el("span", "when", typeof when === "string" ? when : when.full));
+  return row;
+}
+
+async function refresh() {
+  const status = document.getElementById("status");
+  try {
+    const list = await listReports();
+    if (!list.length) {
+      document.getElementById("latest").innerHTML = '<div class="empty">No invasive insects have been reported yet. When the Pyinsect app spots one, it appears here within a minute or two.</div>';
+      status.textContent = "Checked just now";
+      return;
+    }
+    const reports = await Promise.all(list.slice(0, EARLIER + 1).map(loadReport));
+    renderHero(reports[0]);
+    const earlier = document.getElementById("earlier");
+    earlier.innerHTML = "";
+    reports.slice(1).forEach(r => earlier.append(renderRow(r)));
+    document.getElementById("earlierSection").hidden = reports.length < 2;
+    status.className = "status";
+    status.textContent = `${list.length} report${list.length === 1 ? "" : "s"} in total · checked ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · refreshes every 2 minutes`;
+  } catch (e) {
+    status.className = "status error";
+    status.textContent = e.message;
+  }
+}
+
+refresh();
+setInterval(refresh, 120000);
+</script>
+</body>
+</html>
