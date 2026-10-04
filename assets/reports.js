@@ -3,6 +3,8 @@
 // set them here only if the site is hosted somewhere else.
 const OWNER = "";
 const REPO = "";
+// The report relay (Cloudflare Worker, see relay/worker.js). Empty = reporting off.
+const RELAY_URL = "";
 
 function repoFromLocation() {
   const host = location.hostname;
@@ -53,19 +55,25 @@ function formatWhen(iso) {
 
 const niceName = s => s.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
 
-// Writes one file into the repo (used by the app page to file reports)
-async function githubPut(token, path, base64, message) {
-  const where = repoFromLocation();
-  if (!where) throw new Error("Set OWNER and REPO at the top of assets/reports.js.");
-  const res = await fetch(`https://api.github.com/repos/${where.owner}/${where.repo}/contents/${path}`, {
-    method: "PUT",
-    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
-    body: JSON.stringify({ message, content: base64 }),
-  });
-  if (res.status === 422) return;   // already uploaded on an earlier try
-  if (res.status === 401) throw new Error("GitHub rejected the token. It may have expired; save a new one.");
-  if (res.status === 403 || res.status === 404) throw new Error("This token can't write to the reports repository.");
-  if (!res.ok) throw new Error(`GitHub answered ${res.status}.`);
+// Sends one report to the relay (relay/worker.js), which saves it to reports/ in the repo
+async function relaySend(report, photo) {
+  if (!RELAY_URL) throw new Error("Reporting isn't set up yet (RELAY_URL in assets/reports.js).");
+  let res;
+  try {
+    res = await fetch(RELAY_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ report, photo }),
+    });
+  } catch {
+    throw new Error("Couldn't reach the report server. It will be sent later.");
+  }
+  if (res.ok) return;
+  let msg = `the report server answered ${res.status}`;
+  try { msg = (await res.json()).error || msg; } catch {}
+  const e = new Error(msg);
+  e.rejected = res.status === 400;   // the relay will never accept this report
+  throw e;
 }
 
 function el(tag, cls, text) {

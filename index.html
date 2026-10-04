@@ -36,12 +36,8 @@
 
   <details class="reporting" id="reporting">
     <summary>Reporting · <span id="reportState" class="state">checking…</span></summary>
-    <p>Reports are saved to this site's GitHub repository. Paste a GitHub token that can write to it. The token stays in this browser only and is never part of the website.</p>
-    <label for="tokenInput">GitHub token</label>
-    <input id="tokenInput" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_…">
+    <p>When a photo shows an invasive species, a report with a reduced copy of the photo is sent automatically. Nothing to set up. Reports that can't be sent right away (no internet) wait on this device and go out later.</p>
     <div class="actions">
-      <button id="saveToken" class="btn" type="button">Save token</button>
-      <button id="forgetToken" class="btn" type="button">Forget token</button>
       <button id="retryReports" class="btn" type="button" hidden>Send waiting reports</button>
     </div>
   </details>
@@ -222,16 +218,14 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } },
   del(k) { try { localStorage.removeItem(k); } catch {} },
 };
-const token = () => store.get(TOKEN_KEY, "");
+store.del(TOKEN_KEY);   // tokens were only needed before the relay existed
 
 function showReportState() {
-  const where = repoFromLocation();
   const pending = store.get(PENDING_KEY, []).length;
   const st = $("reportState");
-  $("retryReports").hidden = !pending || !token();
-  if (!where) { st.textContent = "off. This page isn't on GitHub Pages."; st.className = "state warn"; return; }
-  if (!token()) { st.textContent = "off. Add a token to file reports."; st.className = "state"; return; }
-  st.textContent = pending ? `on · ${pending} report(s) waiting to send` : `on · reports go to github.com/${where.owner}/${where.repo}`;
+  $("retryReports").hidden = !pending || !RELAY_URL;
+  if (!RELAY_URL) { st.textContent = "off. The report server isn't set up yet."; st.className = "state warn"; return; }
+  st.textContent = pending ? `on · ${pending} report(s) waiting to send` : "on · invasive finds are reported automatically";
   st.className = pending ? "state warn" : "state on";
 }
 
@@ -261,27 +255,33 @@ function buildReport(bmp, species, confidence, top3) {
   };
 }
 
-const toBase64 = s => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
-
 let sending = null;
-// Uploads every waiting report, photo first, so the site only lists a report once its photo is there
+const dropPending = id => store.set(PENDING_KEY, store.get(PENDING_KEY, []).filter(p => p.report.id !== id));
+const markReport = (id, text, cls) =>
+  document.querySelectorAll(`[data-report="${id}"]`).forEach(e => { e.textContent = text; e.className = cls; });
+
+// Sends every waiting report to the relay, oldest first
 function sendPending() {
   if (sending) return sending;
   sending = (async () => {
     let sent = 0, error = null;
     for (;;) {
       const list = store.get(PENDING_KEY, []);
-      if (!list.length || !token()) break;
+      if (!list.length || !RELAY_URL) break;
       const { report, photo } = list[0];
       try {
-        await githubPut(token(), `reports/${report.id}.jpg`, photo, `Photo for ${report.name} report`);
-        await githubPut(token(), `reports/${report.id}.json`, toBase64(JSON.stringify(report, null, 1)), `Invasive species report: ${report.name}`);
-        store.set(PENDING_KEY, store.get(PENDING_KEY, []).filter(p => p.report.id !== report.id));
+        await relaySend(report, photo);
+        dropPending(report.id);
         sent++;
-        document.querySelectorAll(`[data-report="${report.id}"]`).forEach(e => { e.textContent = "Reported"; e.className = "sent ok"; });
+        markReport(report.id, "Reported", "sent ok");
       } catch (e) {
-        error = e.message || "Could not reach GitHub. The report will be sent later.";
-        document.querySelectorAll(`[data-report="${report.id}"]`).forEach(el => { el.textContent = `Waiting to send: ${error}`; el.className = "sent bad"; });
+        if (e.rejected) {   // would fail forever; drop it so later reports still go out
+          dropPending(report.id);
+          markReport(report.id, `Not reported: ${e.message}`, "sent bad");
+          continue;
+        }
+        error = e.message;
+        markReport(report.id, `Waiting to send: ${error}`, "sent bad");
         break;
       }
     }
@@ -294,8 +294,7 @@ function sendPending() {
 function fileReport(bmp, species, confidence, top3, card) {
   const line = el("span", "sent", "");
   card.querySelector(".info").append(line);
-  if (!repoFromLocation()) { line.textContent = "Not reported: this page isn't on GitHub Pages."; return; }
-  if (!token()) { line.textContent = "Not reported: add a GitHub token under Reporting."; line.className = "sent bad"; return; }
+  if (!RELAY_URL) { line.textContent = "Not reported: the report server isn't set up yet."; return; }
   const r = buildReport(bmp, species, confidence, top3);
   line.dataset.report = r.report.id;
   line.textContent = "Sending report…";
@@ -376,18 +375,10 @@ const tray = $("tray");
 ["dragleave", "drop"].forEach(t => tray.addEventListener(t, e => { e.preventDefault(); tray.classList.remove("drag"); }));
 tray.addEventListener("drop", e => handleFiles(e.dataTransfer.files));
 
-$("saveToken").onclick = () => {
-  const v = $("tokenInput").value.trim();
-  if (!v) { $("reportState").textContent = "paste a token first"; $("reportState").className = "state warn"; return; }
-  store.set(TOKEN_KEY, v); $("tokenInput").value = "";
-  showReportState(); sendPending();
-};
-$("forgetToken").onclick = () => { store.del(TOKEN_KEY); showReportState(); };
 $("retryReports").onclick = () => sendPending();
 window.addEventListener("online", () => sendPending());
 
 showReportState();
-if (!token() && repoFromLocation()) $("reporting").open = true;
 sendPending();
 loadModel();
 </script>
