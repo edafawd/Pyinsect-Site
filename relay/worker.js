@@ -37,7 +37,8 @@ let listCache = { at: 0, ids: null };
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const view = env.VIEW_PATH ? "/" + env.VIEW_PATH : null;
+    const word = viewWord(env);
+    const view = word ? "/" + word : null;
     if (view && (url.pathname === view || url.pathname.startsWith(view + "/"))) {
       return viewer(request, env, url.pathname.slice(view.length));
     }
@@ -60,7 +61,10 @@ async function submit(request, env) {
   });
 
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
-  if (request.method === "GET") return reply(200, { ok: true, service: "pyinsect-relay" });
+  if (request.method === "GET") {
+    // Says whether the reports page is set up, never what its address or password is
+    return reply(200, { ok: true, service: "pyinsect-relay", version: 2, reports_page: Boolean(viewWord(env) && env.VIEW_PASSWORD) });
+  }
   if (request.method !== "POST") return reply(405, { error: "Use POST." });
   const origin = request.headers.get("Origin");
   if (env.ALLOWED_ORIGIN && origin !== env.ALLOWED_ORIGIN) return reply(403, { error: "Reports are only accepted from the Pyinsect site." });
@@ -235,6 +239,11 @@ async function githubRead(env, path) {
 }
 
 // ---------- helpers ----------
+
+// VIEW_PATH as typed in Cloudflare, tolerating spaces, slashes or a whole pasted link
+function viewWord(env) {
+  return (env.VIEW_PATH || "").trim().replace(/^[a-z]+:\/\/[^/]+/i, "").replace(/^\/+|\/+$/g, "");
+}
 
 function allow(map, key, windowMs, limit) {
   const slot = Math.floor(Date.now() / windowMs), e = map.get(key);
