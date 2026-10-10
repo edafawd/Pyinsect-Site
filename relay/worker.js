@@ -209,8 +209,9 @@ async function latestReports(env) {
     listCache = { at: Date.now(), ids };
   }
   const ids = listCache.ids;
-  // Cloudflare allows ~50 outgoing requests per visit, so load at most 40 new reports at a time
-  const missing = ids.slice(0, SHOW).filter(id => !reportCache.has(id)).slice(0, 40);
+  // Free Workers may make 50 outgoing requests per visit, and a redirect (old repo name) counts
+  // twice, so load at most 20 new reports per visit; the page refreshes and gets the rest.
+  const missing = ids.slice(0, SHOW).filter(id => !reportCache.has(id)).slice(0, 20);
   await Promise.all(missing.map(async id => {
     const res = await githubRead(env, `reports/${id}.json`);
     if (res) { try { reportCache.set(id, await res.json()); } catch {} }
