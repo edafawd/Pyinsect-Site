@@ -75,7 +75,7 @@ async function submit(request, env) {
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
   if (request.method === "GET") {
     // Says whether the reports page is set up, never what its address or password is
-    return reply(200, { ok: true, service: "pyinsect-relay", version: 5, reports_page: Boolean(viewWord(env) && env.VIEW_PASSWORD), ai_check: Boolean(env.TRUTHSCAN_KEY) });
+    return reply(200, { ok: true, service: "pyinsect-relay", version: 6, reports_page: Boolean(viewWord(env) && env.VIEW_PASSWORD), ai_check: Boolean(env.TRUTHSCAN_KEY) });
   }
   if (request.method !== "POST") return reply(405, { error: "Use POST." });
   const origin = request.headers.get("Origin");
@@ -466,6 +466,9 @@ h2 { font-family: var(--display); font-weight: 500; font-size: 19px; margin: 0; 
 .login { display: flex; flex-direction: column; gap: 10px; max-width: 360px; padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
 .login input[type=password] { font: 15px var(--mono); padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--ink); }
 .login label { font-size: 13px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+.aibox { margin: -8px 0 18px; }
+.aibox label { font-size: 14px; display: flex; gap: 8px; align-items: center; cursor: pointer; }
+.aiwarn { color: var(--alert); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -475,6 +478,11 @@ h2 { font-family: var(--display); font-weight: 500; font-size: 19px; margin: 0; 
     <h1>Latest invasive find</h1>
     <span id="status" class="status">Loading…</span>
   </header>
+
+  <div class="actions aibox" id="aiBox" hidden>
+    <label><input id="aiOn" type="checkbox"> Check photos for AI with the free detector (downloads 172 MB once on this device)</label>
+    <span id="aiStatus" class="status"></span>
+  </div>
 
   <form id="login" class="login" hidden>
     <strong>Enter the reports password</strong>
@@ -515,12 +523,18 @@ function api(path) {
 }
 
 // Photos need the password header, so they're fetched as blobs (once each)
-function photo(img, id) {
-  if (photoUrls[id]) { img.src = photoUrls[id]; return; }
-  api("photo/" + id).then(function (r) { return r.ok ? r.blob() : null; }).then(function (b) {
-    if (b) { photoUrls[id] = URL.createObjectURL(b); img.src = photoUrls[id]; }
-  });
+var photoBlobs = {};
+function getPhoto(id) {
+  if (!photoBlobs[id]) {
+    photoBlobs[id] = api("photo/" + id).then(function (r) {
+      if (!r.ok) throw new Error("photo " + r.status);
+      return r.blob();
+    }).then(function (b) { photoUrls[id] = URL.createObjectURL(b); return b; });
+    photoBlobs[id].catch(function () { delete photoBlobs[id]; });
+  }
+  return photoBlobs[id];
 }
+function photo(img, id) { getPhoto(id).then(function () { img.src = photoUrls[id]; }, function () {}); }
 
 function hero(r) {
   var card = el("article", "hero"), img = el("img"), info = el("div", "info");
@@ -530,6 +544,8 @@ function hero(r) {
   var w = when(r.timestamp), facts = el("dl", "facts");
   [["Reported", w.ago + " · " + w.full], ["Confidence", Number(r.confidence).toFixed(1) + "%"], ["AI check", aiText(r.ai_check)], ["Model", r.model || "—"], ["Report", r.id]]
     .forEach(function (kv) { facts.append(el("dt", null, kv[0]), el("dd", null, kv[1])); });
+  var dd = el("dd"); dd.append(aiSpan(r.id));
+  facts.append(el("dt", null, "AI detector"), dd);
   info.append(facts);
   if (Array.isArray(r.top3) && r.top3.length) {
     info.append(el("span", "eyebrow", "Model's top guesses"));
@@ -558,7 +574,7 @@ function aiText(a) {
 function row(r) {
   var x = el("div", "row"), img = el("img"), what = el("div", "what");
   img.alt = ""; img.loading = "lazy"; photo(img, r.id);
-  what.append(el("strong", null, r.name || niceName(r.species)), el("span", "muted", Number(r.confidence).toFixed(1) + "% confidence · AI check: " + aiText(r.ai_check)));
+  what.append(el("strong", null, r.name || niceName(r.species)), el("span", "muted", Number(r.confidence).toFixed(1) + "% confidence · AI check: " + aiText(r.ai_check)), aiSpan(r.id));
   x.append(img, what, el("span", "when", when(r.timestamp).full));
   x.tabIndex = 0; x.setAttribute("role", "button"); x.title = "Show the whole photo";
   x.onclick = function () { openViewer(r); };
@@ -574,8 +590,9 @@ async function refresh() {
     if (res.status === 401) { showLogin("Wrong password."); return; }
     var data = await res.json();
     if (!res.ok) throw new Error(data.error || ("Error " + res.status));
-    $("login").hidden = true; $("logoutBox").hidden = false;
+    $("login").hidden = true; $("logoutBox").hidden = false; $("aiBox").hidden = false;
     var list = data.reports, ids = list.map(function (r) { return r.id; }).join();
+    lastList = list;
     if (ids !== shownIds) {
       shownIds = ids;
       var box = $("latest"); box.innerHTML = "";
@@ -591,6 +608,7 @@ async function refresh() {
         .forEach(function (n) { tally.append(el("span", "chip", n + " × " + counts[n])); });
       $("tallyTitle").textContent = data.total > list.length ? "Species in the newest " + list.length + " reports" : "Species reported";
       $("tallySection").hidden = !list.length;
+      aiScan(list);
     }
     status.className = "status";
     status.textContent = data.total + " report" + (data.total === 1 ? "" : "s") + " · checked " +
@@ -606,7 +624,7 @@ function showLogin(msg) {
   try { localStorage.removeItem(KEY); sessionStorage.removeItem(KEY); } catch (e) {}
   password = null; shownIds = "";
   ["latest", "earlier", "tally"].forEach(function (id) { $(id).innerHTML = ""; });
-  $("earlierSection").hidden = $("tallySection").hidden = $("logoutBox").hidden = true;
+  $("earlierSection").hidden = $("tallySection").hidden = $("logoutBox").hidden = $("aiBox").hidden = true;
   $("login").hidden = false; $("loginMsg").textContent = msg || "";
   $("status").className = "status"; $("status").textContent = "Password needed";
   $("pw").focus();
@@ -638,6 +656,7 @@ function openViewer(r) {
   if (r.scientific && r.scientific !== r.name) cap.append(el("em", null, r.scientific));
   var w = when(r.timestamp);
   cap.append(el("span", null, Number(r.confidence).toFixed(1) + "% · " + w.full + " · " + (r.model || "")));
+  var ai = aiSpan(r.id); if (ai.textContent) cap.append(ai);
   $("viewer").hidden = false;
   document.body.style.overflow = "hidden";
   $("viewerClose").focus();
@@ -650,6 +669,79 @@ function closeViewer() {
 }
 $("viewer").onclick = closeViewer;
 document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeViewer(); });
+
+// Free AI detector (assets/aidetect.js on the Pyinsect site). It runs here, in this browser, on the
+// saved photos, so visitors download nothing and can't skip it. Only a warning: it catches many AI
+// images but also scores some real photos high, so look at the photo before deciding.
+var SITE = "https://edafawd.github.io/Pyinsect-Site/", AI_KEY = "pyinsect.aiscan", AI_SCORES = "pyinsect.aiscores";
+var aiOn = false, aiScores = {}, aiQueue = [], aiBusy = false, aiReady = null, lastList = [];
+try { aiOn = localStorage.getItem(AI_KEY) === "1"; aiScores = JSON.parse(localStorage.getItem(AI_SCORES) || "{}") || {}; } catch (e) {}
+$("aiOn").checked = aiOn;
+
+function aiStatus(text, bad) { var s = $("aiStatus"); s.className = "status" + (bad ? " error" : ""); s.textContent = text; }
+function aiSpan(id) { var e = el("span"); e.setAttribute("data-ai", id); aiShowEl(e); return e; }
+function aiShowEl(e) {
+  var v = aiScores[e.getAttribute("data-ai")];
+  if (v == null) { e.className = "muted"; e.textContent = aiOn ? "AI detector: checking…" : ""; return; }
+  var pct = Math.round(v * 100);
+  e.className = v >= 0.7 ? "aiwarn" : "muted";
+  e.textContent = v >= 0.7 ? "Possibly AI-made (detector " + pct + "%)" : "AI detector: looks real (" + pct + "%)";
+}
+function aiShowAll() { document.querySelectorAll("[data-ai]").forEach(aiShowEl); }
+
+function loadScript(src) {
+  return new Promise(function (ok, bad) {
+    var s = document.createElement("script"); s.src = src; s.onload = ok;
+    s.onerror = function () { bad(new Error("could not load " + src)); };
+    document.head.append(s);
+  });
+}
+function aiLoad() {
+  if (!aiReady) {
+    aiReady = (typeof ort === "undefined" ? loadScript("https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js") : Promise.resolve())
+      .then(function () { return typeof AIDetect === "undefined" ? loadScript(SITE + "assets/aidetect.js?v=1") : null; })
+      .then(function () { return AIDetect.load(function (p) { aiStatus("Loading the AI detector… " + p + "%"); }); });
+    aiReady.catch(function () { aiReady = null; });
+  }
+  return aiReady;
+}
+
+function aiScan(list) {
+  if (!aiOn) return;
+  list.forEach(function (r) { if (aiScores[r.id] == null && aiQueue.indexOf(r.id) < 0) aiQueue.push(r.id); });
+  aiNext();
+}
+async function aiNext() {
+  if (aiBusy) return;
+  aiBusy = true;
+  try {
+    if (aiQueue.length) await aiLoad();
+    while (aiQueue.length && aiOn) {
+      var id = aiQueue[0];
+      aiStatus("Checking photos for AI… " + aiQueue.length + " left");
+      try {
+        aiScores[id] = Math.round((await AIDetect.score(await getPhoto(id))) * 1000) / 1000;
+        var keep = Object.keys(aiScores).sort().slice(-300), small = {};
+        keep.forEach(function (k) { small[k] = aiScores[k]; });
+        try { localStorage.setItem(AI_SCORES, JSON.stringify(small)); } catch (e) {}
+      } catch (e) {}
+      aiQueue.shift();
+      aiShowAll();
+    }
+    aiStatus(aiOn ? "On · a hint, not proof: it also scores some real photos high" : "");
+  } catch (e) {
+    aiQueue = [];
+    aiStatus("The AI detector didn't load: " + e.message, true);
+  }
+  aiBusy = false;
+}
+
+$("aiOn").onchange = function () {
+  aiOn = this.checked;
+  try { localStorage.setItem(AI_KEY, aiOn ? "1" : "0"); } catch (e) {}
+  if (aiOn) aiScan(lastList); else { aiQueue = []; aiStatus(""); }
+  aiShowAll();
+};
 
 if (password) start(); else showLogin("");
 </script>
