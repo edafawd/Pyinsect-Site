@@ -38,6 +38,7 @@ const TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/;
 const recent = new Map(), wrong = new Map();
 const reportCache = new Map();      // id → report JSON (reports never change)
 let listCache = { at: 0, ids: null };
+let privateCheck = { repo: null, at: 0 };   // last time GITHUB_REPO was confirmed private
 
 export default {
   async fetch(request, env) {
@@ -85,6 +86,15 @@ async function submit(request, env) {
   count(recent, ip, 3600000);
 
   const { report, photo } = checked;
+  // Never save into a public repo (it happened twice when GITHUB_REPO was reset). Not a 400, so the
+  // site keeps the report and sends it again once the setting is fixed.
+  try {
+    if (!(await repoIsPrivate(env))) {
+      return reply(503, { error: "The relay's reports repo isn't private, so the report is held back. Set GITHUB_REPO to the private repo." });
+    }
+  } catch (e) {
+    return reply(502, { error: e.message });
+  }
   try {
     // Photo first, so the reports page only lists a report once its photo exists
     await githubCreate(env, `reports/${report.id}.jpg`, photo, `Photo for ${report.name} report`);
@@ -217,7 +227,7 @@ async function samePassword(given, real) {
 // ---------- GitHub ----------
 
 function gh(env, path, init = {}) {
-  return fetch(`https://api.github.com/repos/${env.GITHUB_REPO}/${path}`, {
+  return fetch(`https://api.github.com/repos/${env.GITHUB_REPO}${path ? "/" + path : ""}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${env.GITHUB_TOKEN}`,
@@ -233,6 +243,17 @@ function ghError(status) {
   if (status === 401) return "The relay's GitHub token was rejected (expired?).";
   if (status === 403 || status === 404) return "The relay's GitHub token can't use the reports repo.";
   return `GitHub answered ${status}.`;
+}
+
+// True when GITHUB_REPO is a private repo (checked at most every 10 minutes per Cloudflare server)
+async function repoIsPrivate(env) {
+  if (privateCheck.repo === env.GITHUB_REPO && Date.now() - privateCheck.at < 600000) return true;
+  const res = await gh(env, "");
+  if (!res.ok) throw new Error(ghError(res.status));
+  const info = await res.json();
+  if (info.private !== true) return false;
+  privateCheck = { repo: env.GITHUB_REPO, at: Date.now() };
+  return true;
 }
 
 // Creates a file; never overwrites (GitHub answers 422 when the file already exists)
