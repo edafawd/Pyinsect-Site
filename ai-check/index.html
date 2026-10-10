@@ -10,7 +10,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=20261010d">
+<link rel="stylesheet" href="../assets/site.css?v=20261010e">
 <style>
 .verdict { align-self: flex-start; font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; font-weight: 500; padding: 3px 10px; border-radius: 999px; color: #fff; }
 .verdict.ai { background: #6b4bb3; }
@@ -62,8 +62,7 @@
       <li>Blocked: uploads with no camera details. This catches AI images that were cropped, edited or screenshotted to remove their labels, but also real photos that lost their details, e.g. ones forwarded through WhatsApp or Messenger, downloaded from the web, or screenshots.</li>
       <li>Still possible: someone who adds fake camera details with special software. That takes real effort, unlike cropping.</li>
       <li>For now this stricter rule is only on this test page; the identifier pages still block only AI-labelled photos.</li>
-      <li><strong>TruthScan</strong> judges the picture itself, so cropping or screenshotting doesn't hide an AI image from it. The relay checks every report with it before saving (when a TruthScan key is set up) and rejects confident "AI Generated" / "AI Edited" results. Each check uses one TruthScan scan; AI detection is a strong signal, not proof.</li>
-      <li><strong>Free AI detector</strong> also judges the picture itself, for free, in your browser (it downloads 172 MB the first time). It's weaker: in our test it caught 2 of 3 AI insect images and scored about 1 in 5 real photos as AI. So it never blocks anything; it only puts a "Possibly AI-made" warning on the private reports page.</li>
+      <li><strong>AI check</strong> judges the picture itself in your browser (it downloads 172 MB the first time), so it also works on screenshots and cropped images. The private reports page runs it on every report and marks each one "AI-made" or "Real".</li>
     </ul>
   </section>
 </div>
@@ -75,9 +74,9 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
-<script src="../assets/reports.js?v=20261010d"></script>
-<script src="../assets/aicheck.js?v=20261010d"></script>
-<script src="../assets/aidetect.js?v=20261010d"></script>
+<script src="../assets/reports.js?v=20261010e"></script>
+<script src="../assets/aicheck.js?v=20261010e"></script>
+<script src="../assets/aidetect.js?v=20261010e"></script>
 <script>
 const $ = id => document.getElementById(id);
 const LABEL = {
@@ -118,28 +117,8 @@ async function check(file) {
   if (r.error) add("Error", r.error);
   info.append(facts);
 
-  // TruthScan looks at the picture itself, so cropping doesn't hide an AI image from it
-  const ts = el("div", "actions"), btn = el("button", "btn", "Check with TruthScan (uses 1 scan)"), out = el("span", "status");
-  btn.type = "button";
-  btn.onclick = async () => {
-    btn.disabled = true; out.className = "status"; out.textContent = "Checking with TruthScan… (up to 30 s)";
-    try {
-      const t = await truthscan(file);
-      if (t.status === "done") {
-        out.className = "status" + (t.blocked ? " error" : "");
-        out.textContent = `TruthScan: ${t.label} ${Math.round(t.confidence)}% → ` + (t.blocked ? "the relay would block this report" : `passes (blocks AI at ${t.threshold}%+)`);
-        if (t.blocked) card.className = "card invasive";
-      } else {
-        out.className = "status error"; out.textContent = "TruthScan didn't answer: " + (t.reason || t.error || "unknown") + ". A real report would still be saved, marked \"AI check: not run\".";
-      }
-    } catch (e) { out.className = "status error"; out.textContent = e.message; }
-    btn.disabled = false;
-  };
-  ts.append(btn, out);
-  info.append(ts);
-
   // Free detector: judges the pixels in this browser. The reports page shows the same score as a warning.
-  const fd = el("div", "actions"), fbtn = el("button", "btn", "Free AI detector"), fout = el("span", "status");
+  const fd = el("div", "actions"), fbtn = el("button", "btn", "AI check"), fout = el("span", "status");
   fbtn.type = "button";
   fbtn.onclick = async () => {
     fbtn.disabled = true; fout.className = "status"; fout.textContent = "Starting the free detector…";
@@ -149,8 +128,8 @@ async function check(file) {
       const v = await AIDetect.score(await reduced(file)), pc = Math.round(v * 100);
       fout.className = "status" + (v >= AIDetect.THRESHOLD ? " error" : "");
       fout.textContent = v >= AIDetect.THRESHOLD
-        ? `Free detector: ${pc}% AI → the reports page would mark it "Possibly AI-made"`
-        : `Free detector: ${pc}% AI → looks real`;
+        ? `AI check: AI-made (${pc}%)`
+        : `AI check: Real (${100 - pc}%)`;
     } catch (e) { fout.className = "status error"; fout.textContent = "The free detector didn't load: " + e.message; }
     fbtn.disabled = false;
   };
@@ -168,19 +147,6 @@ async function reduced(file) {
   return new Promise(ok => c.toBlob(ok, "image/jpeg", 0.8));
 }
 
-// Sends the same reduced copy a real report sends (longest side 1024 px, JPEG) to the relay's test endpoint
-async function truthscan(file) {
-  const bmp = await createImageBitmap(file);
-  const scale = Math.min(1, 1024 / Math.max(bmp.width, bmp.height));
-  const c = document.createElement("canvas");
-  c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
-  c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
-  const photo = c.toDataURL("image/jpeg", 0.8).split(",")[1];
-  const res = await fetch(RELAY_URL.replace(/\/$/, "") + "/aicheck", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ photo }) });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `The relay answered ${res.status}.`);
-  return data;
-}
 
 let viewerReturn = null;
 function openViewer(src, title) {

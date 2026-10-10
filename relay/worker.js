@@ -10,8 +10,6 @@
 //   ALLOWED_ORIGIN  Text, e.g. https://edafawd.github.io
 //   VIEW_PASSWORD   Secret. Password for the reports page.
 //   VIEW_PATH       Secret. The secret word in the reports page address (letters, digits, - and _).
-//   TRUTHSCAN_KEY   Secret, optional. TruthScan API key: every report photo is checked for AI
-//                   generation before it's saved (truthscan.com). Without it reports aren't checked.
 
 // Must match INVASIVE in index.html (scientific names, as Pyinsect 2.8+ outputs them)
 const INVASIVE = new Set([
@@ -33,15 +31,11 @@ const PER_IP_LIMIT = 30;            // reports per IP per hour (per Cloudflare s
 const WRONG_PASSWORD_LIMIT = 10;    // wrong passwords per IP per 15 minutes (best effort)
 const SHOW = 40;                    // newest reports sent to the reports page
 const LIST_CACHE_MS = 5000;         // GitHub is asked for the file list at most every 5 s
-const AI_BLOCK_CONFIDENCE = 70;     // TruthScan "AI Generated"/"AI Edited" at or above this % is rejected
-const AI_CHECK_LIMIT = 10;          // /aicheck test-page scans per IP per hour (each costs a TruthScan credit)
-const TRUTHSCAN = "https://detect-image.truthscan.com";
-const TRUTHSCAN_STORAGE = "https://ai-image-detector-prod.nyc3.digitaloceanspaces.com/";
 
 const ID_RE = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-[0-9a-f]{1,8}$/;
 const SPECIES_RE = /^[a-z_]{1,48}$/;
 const TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/;
-const recent = new Map(), wrong = new Map(), scans = new Map();
+const recent = new Map(), wrong = new Map();
 const reportCache = new Map();      // id → report JSON (reports never change)
 let listCache = { at: 0, ids: null };
 
@@ -53,7 +47,6 @@ export default {
     if (view && (url.pathname === view || url.pathname.startsWith(view + "/"))) {
       return viewer(request, env, url.pathname.slice(view.length));
     }
-    if (url.pathname === "/aicheck") return aiCheckEndpoint(request, env);
     return submit(request, env);
   },
 };
@@ -75,7 +68,7 @@ async function submit(request, env) {
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
   if (request.method === "GET") {
     // Says whether the reports page is set up, never what its address or password is
-    return reply(200, { ok: true, service: "pyinsect-relay", version: 6, reports_page: Boolean(viewWord(env) && env.VIEW_PASSWORD), ai_check: Boolean(env.TRUTHSCAN_KEY) });
+    return reply(200, { ok: true, service: "pyinsect-relay", version: 7, reports_page: Boolean(viewWord(env) && env.VIEW_PASSWORD) });
   }
   if (request.method !== "POST") return reply(405, { error: "Use POST." });
   const origin = request.headers.get("Origin");
@@ -92,13 +85,6 @@ async function submit(request, env) {
   count(recent, ip, 3600000);
 
   const { report, photo } = checked;
-  // AI check: a confident "AI Generated"/"AI Edited" verdict rejects the report (400, so the site
-  // tells the user and doesn't retry). If TruthScan can't answer, the report is kept and marked.
-  const scan = await truthscanCheck(env, base64ToBytes(photo));
-  if (scan.blocked) {
-    return reply(400, { error: `This photo looks AI-generated (TruthScan: ${scan.label}, ${Math.round(scan.confidence)}%).`, ai_check: scan });
-  }
-  report.ai_check = scan;
   try {
     // Photo first, so the reports page only lists a report once its photo exists
     await githubCreate(env, `reports/${report.id}.jpg`, photo, `Photo for ${report.name} report`);
@@ -264,83 +250,6 @@ async function githubRead(env, path) {
   return res;
 }
 
-// ---------- TruthScan AI-image check ----------
-
-// Test page: checks one photo without saving anything. Same origin rule as reports, and few scans
-// per IP because every scan costs a TruthScan credit.
-async function aiCheckEndpoint(request, env) {
-  const cors = {
-    "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN || "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
-    Vary: "Origin",
-  };
-  const reply = (status, body) => new Response(JSON.stringify(body), { status, headers: { ...cors, "Content-Type": "application/json" } });
-  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
-  if (request.method !== "POST") return reply(405, { error: "Use POST." });
-  if (env.ALLOWED_ORIGIN && request.headers.get("Origin") !== env.ALLOWED_ORIGIN) return reply(403, { error: "Only the Pyinsect site can use this." });
-  if (!env.TRUTHSCAN_KEY) return reply(503, { error: "TruthScan isn't set up on the relay yet (TRUTHSCAN_KEY missing)." });
-  const ip = request.headers.get("CF-Connecting-IP") || "?";
-  if (!allow(scans, ip, 3600000, AI_CHECK_LIMIT)) return reply(429, { error: `Test limit reached (${AI_CHECK_LIMIT} TruthScan checks per hour).` });
-  let body;
-  try { body = await request.json(); } catch { return reply(400, { error: "Not valid JSON." }); }
-  const photo = body && body.photo;
-  if (typeof photo !== "string" || photo.length > MAX_PHOTO_BYTES * 4 / 3 + 4) return reply(400, { error: "Photo missing or too large." });
-  let bytes;
-  try { bytes = base64ToBytes(photo); } catch { return reply(400, { error: "Photo isn't valid base64." }); }
-  if (bytes[0] !== 0xFF || bytes[1] !== 0xD8) return reply(400, { error: "Photo must be a JPEG." });
-  count(scans, ip, 3600000);
-  return reply(200, { ...(await truthscanCheck(env, bytes)), threshold: AI_BLOCK_CONFIDENCE });
-}
-
-// presign → upload → detect → poll, as in TruthScan's own client. Never throws: on any problem it
-// returns { status: "unavailable", reason } so a real report isn't lost because TruthScan is down.
-async function truthscanCheck(env, bytes) {
-  if (!env.TRUTHSCAN_KEY) return { status: "unavailable", reason: "not set up" };
-  const key = env.TRUTHSCAN_KEY;
-  try {
-    const name = `pyinsect-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.jpg`;
-    let res = await fetch(`${TRUTHSCAN}/get-presigned-url?file_name=${name}`, { headers: { apikey: key } });
-    if (res.status === 403) return { status: "unavailable", reason: "TruthScan key rejected or out of credits" };
-    if (!res.ok) return { status: "unavailable", reason: `TruthScan presign ${res.status}` };
-    const pre = await res.json();
-    res = await fetch(pre.presigned_url, { method: "PUT", headers: { "Content-Type": "image/jpeg", "x-amz-acl": "private" }, body: bytes });
-    if (!res.ok) return { status: "unavailable", reason: `TruthScan upload ${res.status}` };
-    const fileUrl = /^https?:/.test(pre.file_path) ? pre.file_path : TRUTHSCAN_STORAGE + String(pre.file_path).replace(/^\//, "");
-    res = await fetch(`${TRUTHSCAN}/detect`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ key, url: fileUrl, document_type: "Image", model: "generic", generate_preview: false,
-        generate_analysis_details: false, generate_heatmap: false, user_agent: "pyinsect-relay" }),
-    });
-    if (res.status === 403) return { status: "unavailable", reason: "TruthScan key rejected or out of credits" };
-    if (!res.ok) return { status: "unavailable", reason: `TruthScan detect ${res.status}` };
-    const { id } = await res.json();
-    for (let i = 0; i < 25; i++) {
-      await new Promise(r => setTimeout(r, 1000));
-      res = await fetch(`${TRUTHSCAN}/query`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) });
-      if (!res.ok) continue;
-      const q = await res.json();
-      if (q.status === "failed") return { status: "unavailable", reason: "TruthScan couldn't analyse the photo" };
-      if (q.status === "done") {
-        const d = q.result_details || {};
-        const label = String(d.final_result || (Number(q.result) >= 50 ? "AI Generated" : "Real"));
-        const confidence = Number(d.final_label_confidence ?? q.result ?? 0);
-        const ai = /^ai /i.test(label);   // "AI Generated" or "AI Edited"
-        return { status: "done", label, confidence, blocked: ai && confidence >= AI_BLOCK_CONFIDENCE, id };
-      }
-    }
-    return { status: "unavailable", reason: "TruthScan took too long" };
-  } catch (e) {
-    return { status: "unavailable", reason: "TruthScan unreachable" };
-  }
-}
-
-function base64ToBytes(b64) {
-  const bin = atob(b64), out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
 // ---------- helpers ----------
 
 // VIEW_PATH as typed in Cloudflare, tolerating spaces, slashes or a whole pasted link
@@ -468,7 +377,6 @@ h2 { font-family: var(--display); font-weight: 500; font-size: 19px; margin: 0; 
 .login input[type=password] { font: 15px var(--mono); padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--ink); }
 .login label { font-size: 13px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
 .aibox { margin: -8px 0 18px; }
-.aibox label { font-size: 14px; display: flex; gap: 8px; align-items: center; cursor: pointer; }
 .aiwarn { color: var(--alert); font-weight: 600; }
 </style>
 </head>
@@ -480,10 +388,7 @@ h2 { font-family: var(--display); font-weight: 500; font-size: 19px; margin: 0; 
     <span id="status" class="status">Loading…</span>
   </header>
 
-  <div class="actions aibox" id="aiBox" hidden>
-    <label><input id="aiOn" type="checkbox"> Check photos for AI with the free detector (downloads 172 MB once on this device)</label>
-    <span id="aiStatus" class="status"></span>
-  </div>
+  <div class="actions aibox" id="aiBox" hidden><span id="aiStatus" class="status"></span></div>
 
   <form id="login" class="login" hidden>
     <strong>Enter the reports password</strong>
@@ -543,10 +448,10 @@ function hero(r) {
   info.append(el("span", "flag", "Invasive"), el("p", "species", r.name || niceName(r.species)));
   if (r.scientific && r.scientific !== r.name) info.append(el("span", "sci", r.scientific));
   var w = when(r.timestamp), facts = el("dl", "facts");
-  [["Reported", w.ago + " · " + w.full], ["Confidence", Number(r.confidence).toFixed(1) + "%"], ["AI check", aiText(r.ai_check)], ["Model", r.model || "—"], ["Report", r.id]]
+  [["Reported", w.ago + " · " + w.full], ["Confidence", Number(r.confidence).toFixed(1) + "%"], ["Model", r.model || "—"], ["Report", r.id]]
     .forEach(function (kv) { facts.append(el("dt", null, kv[0]), el("dd", null, kv[1])); });
   var dd = el("dd"); dd.append(aiSpan(r.id));
-  facts.append(el("dt", null, "AI detector"), dd);
+  facts.append(el("dt", null, "AI check"), dd);
   info.append(facts);
   if (Array.isArray(r.top3) && r.top3.length) {
     info.append(el("span", "eyebrow", "Model's top guesses"));
@@ -566,16 +471,10 @@ function hero(r) {
   return card;
 }
 
-function aiText(a) {
-  if (!a) return "not checked";
-  if (a.status === "done") return a.label + " " + Math.round(a.confidence) + "% (TruthScan)";
-  return "not run" + (a.reason ? " (" + a.reason + ")" : "");
-}
-
 function row(r) {
   var x = el("div", "row"), img = el("img"), what = el("div", "what");
   img.alt = ""; img.loading = "lazy"; photo(img, r.id);
-  what.append(el("strong", null, r.name || niceName(r.species)), el("span", "muted", Number(r.confidence).toFixed(1) + "% confidence · AI check: " + aiText(r.ai_check)), aiSpan(r.id));
+  what.append(el("strong", null, r.name || niceName(r.species)), el("span", "muted", Number(r.confidence).toFixed(1) + "% confidence · "), aiSpan(r.id));
   x.append(img, what, el("span", "when", when(r.timestamp).full));
   x.tabIndex = 0; x.setAttribute("role", "button"); x.title = "Show the whole photo";
   x.onclick = function () { openViewer(r); };
@@ -671,22 +570,21 @@ function closeViewer() {
 $("viewer").onclick = closeViewer;
 document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeViewer(); });
 
-// Free AI detector (assets/aidetect.js on the Pyinsect site). It runs here, in this browser, on the
-// saved photos, so visitors download nothing and can't skip it. Only a warning: it catches many AI
-// images but also scores some real photos high, so look at the photo before deciding.
-var SITE = "https://edafawd.github.io/Pyinsect-Site/", AI_KEY = "pyinsect.aiscan", AI_SCORES = "pyinsect.aiscores";
-var aiOn = false, aiScores = {}, aiQueue = [], aiBusy = false, aiReady = null, lastList = [];
-try { aiOn = localStorage.getItem(AI_KEY) === "1"; aiScores = JSON.parse(localStorage.getItem(AI_SCORES) || "{}") || {}; } catch (e) {}
-$("aiOn").checked = aiOn;
+// Free AI detector (assets/aidetect.js on the Pyinsect site), always on. It runs here, in this browser,
+// on the saved photos, so visitors download nothing and can't skip it. 172 MB the first time per device.
+// The user chose plain "AI-made" / "Real" labels; the % is the detector's score (it does make mistakes).
+var SITE = "https://edafawd.github.io/Pyinsect-Site/", AI_SCORES = "pyinsect.aiscores";
+var aiOn = true, aiScores = {}, aiQueue = [], aiBusy = false, aiReady = null, lastList = [];
+try { aiScores = JSON.parse(localStorage.getItem(AI_SCORES) || "{}") || {}; } catch (e) {}
 
 function aiStatus(text, bad) { var s = $("aiStatus"); s.className = "status" + (bad ? " error" : ""); s.textContent = text; }
 function aiSpan(id) { var e = el("span"); e.setAttribute("data-ai", id); aiShowEl(e); return e; }
 function aiShowEl(e) {
   var v = aiScores[e.getAttribute("data-ai")];
-  if (v == null) { e.className = "muted"; e.textContent = aiOn ? "AI detector: checking…" : ""; return; }
+  if (v == null) { e.className = "muted"; e.textContent = "AI check: checking…"; return; }
   var pct = Math.round(v * 100);
   e.className = v >= 0.7 ? "aiwarn" : "muted";
-  e.textContent = v >= 0.7 ? "Possibly AI-made (detector " + pct + "%)" : "AI detector: looks real (" + pct + "%)";
+  e.textContent = v >= 0.7 ? "AI-made (" + pct + "%)" : "Real (" + (100 - pct) + "%)";
 }
 function aiShowAll() { document.querySelectorAll("[data-ai]").forEach(aiShowEl); }
 
@@ -729,20 +627,13 @@ async function aiNext() {
       aiQueue.shift();
       aiShowAll();
     }
-    aiStatus(aiOn ? "On · a hint, not proof: it also scores some real photos high" : "");
+    aiStatus("AI check: done");
   } catch (e) {
     aiQueue = [];
     aiStatus("The AI detector didn't load: " + e.message, true);
   }
   aiBusy = false;
 }
-
-$("aiOn").onchange = function () {
-  aiOn = this.checked;
-  try { localStorage.setItem(AI_KEY, aiOn ? "1" : "0"); } catch (e) {}
-  if (aiOn) aiScan(lastList); else { aiQueue = []; aiStatus(""); }
-  aiShowAll();
-};
 
 if (password) start(); else showLogin("");
 </script>
