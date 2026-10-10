@@ -223,6 +223,35 @@ function fileReport(bmp, species, confidence, top3, card) {
   sendPending();
 }
 
+// ---------- blur check ----------
+// Sharpness = the highest Laplacian variance among a 4×4 grid of tiles on a grey copy (longest side
+// 512 px), so a sharp insect on a soft background still counts as sharp. Oct 10 calibration on 300 of
+// the user's photos: below 40 caught 297/300 lightly blurred copies and 300/300 strongly blurred ones,
+// and flagged 3/300 originals (all genuinely soft).
+const BLUR_THRESHOLD = 40;
+function sharpness(bmp) {
+  const s = Math.min(1, 512 / Math.max(bmp.width, bmp.height));
+  const w = Math.max(3, Math.round(bmp.width * s)), h = Math.max(3, Math.round(bmp.height * s));
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(bmp, 0, 0, w, h);
+  const d = ctx.getImageData(0, 0, w, h).data, g = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) g[i] = d[i * 4] * .299 + d[i * 4 + 1] * .587 + d[i * 4 + 2] * .114;
+  const sum = new Float64Array(16), sq = new Float64Array(16), n = new Float64Array(16);
+  for (let y = 1; y < h - 1; y++) {
+    const ty = Math.min(3, Math.floor((y - 1) * 4 / (h - 2)));
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x, v = g[i - 1] + g[i + 1] + g[i - w] + g[i + w] - 4 * g[i];
+      const t = ty * 4 + Math.min(3, Math.floor((x - 1) * 4 / (w - 2)));
+      sum[t] += v; sq[t] += v * v; n[t]++;
+    }
+  }
+  let best = 0;
+  for (let t = 0; t < 16; t++) if (n[t]) best = Math.max(best, sq[t] / n[t] - (sum[t] / n[t]) ** 2);
+  return best;
+}
+
 // An AI-made photo is never reported; the card says why
 function blockReport(card, ai) {
   const info = card.querySelector(".info");
@@ -349,7 +378,11 @@ function classify(file) {
       const probs = softmax(Array.from(out[session.outputNames[0]].data));
       const top3 = [...probs.keys()].sort((a, b) => probs[b] - probs[a]).slice(0, 3)
         .map(i => ({ species: CLASS_NAMES[i] ?? `idx_${i}`, confidence: probs[i] * 100 }));
-      if (fillCard(card, top3)) {
+      const invasive = fillCard(card, top3);
+      if (sharpness(bmp) < BLUR_THRESHOLD) {
+        card.querySelector(".info .name").after(el("span", "blurry", "Blurry photo: try to get a clearer image."));
+      }
+      if (invasive) {
         // Photos from the in-page camera come straight from the camera; uploads are checked for AI labels
         const ai = file.fromCamera ? { verdict: "camera", reasons: [] } : await checkAI(file).catch(() => ({ verdict: "unknown", reasons: [] }));
         if (ai.verdict === "ai") blockReport(card, ai);
